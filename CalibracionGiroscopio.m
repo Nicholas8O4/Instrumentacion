@@ -1,15 +1,17 @@
 clearvars; close all; clc;
 
 %% ========== CONFIGURACIÓN GENERAL ==========
-archivo = 'Sis_3.mat';
-if ~exist(archivo,'file'), error('No se encontró %s. Pon el archivo en la carpeta actual.', archivo); end
-load(archivo); % debe contener Acceleration, AngularVelocity
+nombreArchivo = 'Sis_3.mat';
+if ~exist(nombreArchivo,'file')
+    error('No se encontró %s. Pon el archivo en la carpeta actual.', nombreArchivo);
+end
+load(nombreArchivo); % debe contener Acceleration, AngularVelocity
 
-g = 9.81;                    % gravedad
+gravedad = 9.81;                    % valor de g en m/s^2
 % Detector estático (rango + movstd)
 rango_inicial = 0.20;        % m/s^2, detección amplia sobre señal calibrada (ajusta)
-rango_final   = 0.20;        % m/s^2, detección final sobre señal calibrada (ajusta)
-durMinSeg = 0.8;             % duración mínima del intervalo (s)
+rango_final   = 0.20;        % m/s^2 para la detección final sobre señal calibrada (ajusta)
+duracionMinSeg = 0.8;        % duración mínima del intervalo (s)
 ventanaSeg_estable = 0.5;    % ventana para movstd inicial (s)
 umbral_movstd_estable = 0.08;% umbral movstd inicial (m/s^2)
 maxIntervalos = 20;          % máximo intervalos estáticos a usar
@@ -20,14 +22,14 @@ maxIterLSQ = 800;
 %% ========== EXTRAER SEÑALES ==========
 ax = Acceleration.X(:); ay = Acceleration.Y(:); az = Acceleration.Z(:);
 t_acc = seconds(Acceleration.Timestamp - Acceleration.Timestamp(1));
-A_raw = [ax ay az];
-N = size(A_raw,1);
+Aac = [ax ay az];
+N = size(Aac,1);
 dt_acc = median(diff(t_acc)); if dt_acc<=0, dt_acc = 0.01; end
 fs_acc = 1/dt_acc;
 
 wx = AngularVelocity.X(:); wy = AngularVelocity.Y(:); wz = AngularVelocity.Z(:);
 t_gyro = seconds(AngularVelocity.Timestamp - AngularVelocity.Timestamp(1));
-W = [wx wy wz];
+Wg = [wx wy wz];
 dt_gyro = median(diff(t_gyro)); if dt_gyro<=0, dt_gyro = 0.01; end
 fs_gyro = 1/dt_gyro;
 
@@ -35,31 +37,33 @@ fs_gyro = 1/dt_gyro;
 % 1) DETECCIÓN INICIAL DE TRAMOS DE BAJA VARIACIÓN (candidatos)
 %% =========================
 winSamples = max(1, round(ventanaSeg_estable * fs_acc));
-magnitud_comb = sqrt(sum(A_raw.^2,2));
-movstd_acel = movstd(magnitud_comb, winSamples);
-mask_estable = movstd_acel < umbral_movstd_estable;
+magnitudA_cruda = sqrt(sum(Aac.^2,2));
+movstdA = movstd(magnitudA_cruda, winSamples);
+mascara_estable = movstdA < umbral_movstd_estable;
 
-d = diff([0; mask_estable(:); 0]);
-inicio = find(d==1);
-fin   = find(d==-1)-1;
+d = diff([0; mascara_estable(:); 0]);
+inicios = find(d==1);
+finales = find(d==-1)-1;
 
-if isempty(inicio)
+if isempty(inicios)
     warning('No se detectaron tramos de baja variación con parámetros iniciales. Se intentará con todo el registro.');
-    inicio = 1; fin = N;
+    inicios = 1; finales = N;
 end
 
-% Filtrar por duración
-duraciones = t_acc(fin) - t_acc(inicio);
-keep = duraciones >= 0.25; % ventanas cortas permitidas para que SVD tenga muchas caras candidatas
-inicio = inicio(keep); fin = fin(keep); duraciones = duraciones(keep);
-nSeg = numel(inicio);
+% Filtrar por duración (se permiten ventanas cortas para tener muchas caras candidatas)
+duraciones = t_acc(finales) - t_acc(inicios);
+conservar = duraciones >= 0.25;
+inicios = inicios(conservar);
+finales = finales(conservar);
+duraciones = duraciones(conservar);
+nSeg = numel(inicios);
 fprintf('Tramos de baja variación detectados: %d\n', nSeg);
 
 % Promedios por tramo X (candidatos)
 X_candidatos = nan(nSeg,3);
 for k=1:nSeg
-    idx = inicio(k):fin(k);
-    X_candidatos(k,:) = mean(A_raw(idx,:),1);
+    idx = inicios(k):finales(k);
+    X_candidatos(k,:) = mean(Aac(idx,:),1);
 end
 
 %% =========================
@@ -85,16 +89,16 @@ Rval = centro' * A_quad * centro - C;
 
 if Rval <= 0 || any(eig(A_quad) <= 0)
     warning('Elipsoide algebraico no válido; usando identidad como inicial.');
-    M_inicial = eye(3); b_inicial = zeros(3,1);
+    M_init = eye(3); b_init = zeros(3,1);
 else
     L = sqrtm(A_quad);
-    M_inicial = (g / sqrt(Rval)) * L;
-    b_inicial = - M_inicial * centro;
+    M_init = (gravedad / sqrt(Rval)) * L;
+    b_init = - M_init * centro;
 end
 
 % Refinamiento no lineal
-p0 = [reshape(M_inicial,9,1); b_inicial(:)];
-resfun_acc = @(p) acc_residuals(p, X_candidatos, g);
+p0 = [reshape(M_init,9,1); b_init(:)];
+resfun_acc = @(p) acc_residuals(p, X_candidatos, gravedad);
 opts_acc = optimoptions('lsqnonlin','Display','off','TolFun',1e-12,'TolX',1e-12,'MaxIter',1000,'Algorithm','levenberg-marquardt');
 try
     p_est = lsqnonlin(resfun_acc, p0, [], [], opts_acc);
@@ -106,9 +110,9 @@ M_est_acc = reshape(p_est(1:9),3,3);
 b_est_acc = p_est(10:12);
 
 % Aplicar calibración al conjunto
-A_cal_all = (M_est_acc * A_raw.' ).' + repmat(b_est_acc.', N, 1);
+A_cal_all = (M_est_acc * Aac.' ).' + repmat(b_est_acc.', N, 1);
 magA_cal = vecnorm(A_cal_all,2,2);
-fprintf('RMS de ||A_cal||-g (global): %.6g\n', sqrt(mean((magA_cal - g).^2)));
+fprintf('RMS de ||A_cal||-g (global): %.6g\n', sqrt(mean((magA_cal - gravedad).^2)));
 
 %% =========================
 % 3) DETECCIÓN ROBUSTA DE INTERVALOS ESTÁTICOS (rango + movstd)
@@ -118,15 +122,15 @@ tol = 0.6; % rango amplio para primera máscara
 winSTD = round(0.25*fs_acc);
 thrSTD = 0.06;
 
-mask_range = abs(magA_cal - g) < tol;
+mascara_rango = abs(magA_cal - gravedad) < tol;
 movstd_cal = movstd(magA_cal, winSTD);
-mask_stable = movstd_cal < thrSTD;
-mask_static = mask_range & mask_stable;
+mascara_estable2 = movstd_cal < thrSTD;
+mascara_estatica = mascara_rango & mascara_estable2;
 
-d = diff([0; mask_static(:); 0]);
-inicio_rob = find(d==1);
-fin_rob   = find(d==-1)-1;
-nSeg_rob = length(inicio_rob);
+d = diff([0; mascara_estatica(:); 0]);
+inicios_rob = find(d==1);
+finales_rob   = find(d==-1)-1;
+nSeg_rob = length(inicios_rob);
 fprintf('Intervalos estáticos detectados (robusto, preliminar): %d\n', nSeg_rob);
 
 % Calcular calidad y limitar a maxIntervalos
@@ -136,82 +140,81 @@ end
 
 calidad = zeros(nSeg_rob,1);
 for k=1:nSeg_rob
-    idx = inicio_rob(k):fin_rob(k);
+    idx = inicios_rob(k):finales_rob(k);
     seg_mag = magA_cal(idx);
-    err_g = mean(abs(seg_mag - g));
+    err_g = mean(abs(seg_mag - gravedad));
     est = std(seg_mag);
-    dur = t_acc(fin_rob(k)) - t_acc(inicio_rob(k));
+    dur = t_acc(finales_rob(k)) - t_acc(inicios_rob(k));
     calidad(k) = err_g*2 + est + 0.2/(dur+0.001);
 end
-[~, idxBest] = sort(calidad,'ascend');
+[~, idxMejor] = sort(calidad,'ascend');
 
-sel = idxBest(1:min(maxIntervalos,length(idxBest))); % seleccionar los mejores
-inicio_sel = inicio_rob(sel);
-fin_sel   = fin_rob(sel);
-% ordenar por tiempo
-[inicio_sel, orden] = sort(inicio_sel);
-fin_sel = fin_sel(orden);
-numIntervals = numel(inicio_sel);
-fprintf('Se usarán %d intervalos estáticos (mejores %d).\n', numIntervals, maxIntervalos);
+seleccionados = idxMejor(1:min(maxIntervalos,length(idxMejor)));
+inicios_sel = inicios_rob(seleccionados);
+finales_sel   = finales_rob(seleccionados);
+[ inicios_sel, orden ] = sort(inicios_sel);
+finales_sel = finales_sel(orden);
+numIntervalos = numel(inicios_sel);
+fprintf('Se usarán %d intervalos estáticos (mejores %d).\n', numIntervalos, maxIntervalos);
 
 % Construir A_cal_mean por intervalo (usado por Tedaldi)
-A_cal_mean = nan(numIntervals,3);
-for k=1:numIntervals
-    idx = inicio_sel(k):fin_sel(k);
+A_cal_mean = nan(numIntervalos,3);
+for k=1:numIntervalos
+    idx = inicios_sel(k):finales_sel(k);
     A_cal_mean(k,:) = mean(A_cal_all(idx,:),1);
 end
 
-% Mostrar resumen simple (opcional)
+% Mostrar resumen simple
 fprintf('Resumen magnitudes por intervalo (media):\n');
-for k=1:numIntervals
-    fprintf(' %2d: |a|_mean=%.4f  dur=%.3fs\n', k, norm(A_cal_mean(k,:)), t_acc(fin_sel(k))-t_acc(inicio_sel(k)));
+for k=1:numIntervalos
+    fprintf(' %2d: |a|_mean=%.4f  dur=%.3fs\n', k, norm(A_cal_mean(k,:)), t_acc(finales_sel(k))-t_acc(inicios_sel(k)));
 end
 
 %% =========================
 % 4) CREAR estructuras para la siguiente etapa
-%    intervals: índices sobre t_acc (para compatibilidad con script de gyro)
+%    intervalos: índices sobre t_acc (compatible con script gyro)
 %% =========================
-intervals = [inicio_sel(:), fin_sel(:)];
+intervalos = [inicios_sel(:), finales_sel(:)];
 
-% Guardar A_cal_all, intervals, A_cal_mean, t_acc para depuración/uso
-save('interv_detectados.mat','intervals','A_cal_all','A_cal_mean','t_acc','magA_cal');
+% Guardar A_cal_all, intervalos, A_cal_mean, t_acc para depuración/uso
+save('interv_detectados.mat','intervalos','A_cal_all','A_cal_mean','t_acc','magA_cal');
 
 %% =========================
 % 5) SINCRONIZAR CON GIROSCOPIO (índices sobre t_gyro por cada intervalo)
 %% =========================
-gyro_intervals = cell(numIntervals,1);
-valid_gyro_interval = false(numIntervals,1);
+intervalos_gyro = cell(numIntervalos,1);
+valido_intervalo_gyro = false(numIntervalos,1);
 
-for k = 1:numIntervals
-    t_start = t_acc(intervals(k,1));
-    t_end   = t_acc(intervals(k,2));
-    idxg = find(t_gyro >= t_start & t_gyro <= t_end);
-    gyro_intervals{k} = idxg;
-    if numel(idxg) >= 2, valid_gyro_interval(k) = true; end
+for k = 1:numIntervalos
+    t_inicio = t_acc(intervalos(k,1));
+    t_fin   = t_acc(intervalos(k,2));
+    idxg = find(t_gyro >= t_inicio & t_gyro <= t_fin);
+    intervalos_gyro{k} = idxg;
+    if numel(idxg) >= 2, valido_intervalo_gyro(k) = true; end
 end
 
 % Filtrar si algún intervalo quedó vacío
-if ~all(valid_gyro_interval)
-    keep = find(valid_gyro_interval);
-    gyro_intervals = gyro_intervals(keep);
+if ~all(valido_intervalo_gyro)
+    keep = find(valido_intervalo_gyro);
+    intervalos_gyro = intervalos_gyro(keep);
     A_cal_mean = A_cal_mean(keep,:);
-    intervals  = intervals(keep,:);
-    numIntervals = numel(keep);
-    fprintf('Se eliminaron %d intervalos sin muestras de gyro. Quedan %d.\n', sum(~valid_gyro_interval), numIntervals);
+    intervalos  = intervalos(keep,:);
+    numIntervalos = numel(keep);
+    fprintf('Se eliminaron %d intervalos sin muestras de gyro. Quedan %d.\n', sum(~valido_intervalo_gyro), numIntervalos);
 end
 
-if numIntervals < 2
-    error('Muy pocos intervalos válidos sincronizados con gyro (%d). No se puede calibrar.', numIntervals);
+if numIntervalos < 2
+    error('Muy pocos intervalos válidos sincronizados con gyro (%d). No se puede calibrar.', numIntervalos);
 end
 
 %% =========================
 % 6) FILTRADO ADICIONAL (Tedaldi): comprobar que giros durante intervalos sean bajos
 %% =========================
-valid2 = false(numIntervals,1);
-for k=1:numIntervals
-    idxg = gyro_intervals{k};
+valid2 = false(numIntervalos,1);
+for k=1:numIntervalos
+    idxg = intervalos_gyro{k};
     if numel(idxg) < 2, valid2(k)=false; continue; end
-    wnorm = vecnorm(W(idxg,:),2,2);
+    wnorm = vecnorm(Wg(idxg,:),2,2);
     mean_w = mean(wnorm);
     max_w  = max(wnorm);
     
@@ -220,31 +223,31 @@ for k=1:numIntervals
     else
         valid2(k) = false;
     end
-
 end
+
 % Aplicar filtro
-gyro_intervals = gyro_intervals(valid2);
+intervalos_gyro = intervalos_gyro(valid2);
 A_cal_mean = A_cal_mean(valid2,:);
-intervals = intervals(valid2,:);
-numIntervals = sum(valid2);
-fprintf('Intervalos estáticos válidos tras filtro gyro: %d\n', numIntervals);
-if numIntervals < 5
-    warning('Tras filtro gyro quedan %d intervalos verdaderamente estáticos. Calibración puede ser menos precisa.', numIntervals);
+intervalos = intervalos(valid2,:);
+numIntervalos = sum(valid2);
+fprintf('Intervalos estáticos válidos tras filtro gyro: %d\n', numIntervalos);
+if numIntervalos < 5
+    warning('Tras filtro gyro quedan %d intervalos verdaderamente estáticos. Calibración puede ser menos precisa.', numIntervalos);
 end
 
 %% =========================
-% 7) PREPARAR función residual para giroscopio (usar función Tedaldi)
+% 7) PREPARAR función residual para giroscopio (usar tu función Tedaldi)
 %% =========================
-gyro_resfun = @(p) gyro_residuals_Tedaldi( ...
-    p, W, t_gyro, gyro_intervals, A_cal_mean, intervals, t_acc, g );
+resfun_gyro = @(p) gyro_residuals_Tedaldi( ...
+    p, Wg, t_gyro, intervalos_gyro, A_cal_mean, intervalos, t_acc, gravedad );
 
 %% =========================
 % 8) AUTOMÁTICO: decidir si calibración completa o solo bias
 %% =========================
 % medir cambios entre intervalos
-if numIntervals >= 2
-    delta_g = zeros(numIntervals-1,1);
-    for k=1:numIntervals-1
+if numIntervalos >= 2
+    delta_g = zeros(numIntervalos-1,1);
+    for k=1:numIntervalos-1
         gk = A_cal_mean(k,:).' / norm(A_cal_mean(k,:));
         gn = A_cal_mean(k+1,:).' / norm(A_cal_mean(k+1,:));
         delta_g(k) = norm(gk - gn);
@@ -254,7 +257,7 @@ if numIntervals >= 2
 else
     max_delta_g = 0; mean_delta_g = 0;
 end
-wnorm_max_all = max(vecnorm(W,2,2));
+wnorm_max_all = max(vecnorm(Wg,2,2));
 fprintf('max_delta_g=%.4f  mean_delta_g=%.4f  max|w|=%.4f\n', max_delta_g, mean_delta_g, wnorm_max_all);
 
 % Criterios (ajustables)
@@ -265,14 +268,14 @@ if cond_no_rotation
     fprintf('Modo: SOLO BIAS (no suficiente rotación para estimar s,S confiables)\n');
     % promedio ponderado de muestras dentro de intervalos
     b_est = zeros(3,1); total=0;
-    for k=1:numIntervals
-        idxg = gyro_intervals{k};
-        b_est = b_est + sum(W(idxg,:)).';
+    for k=1:numIntervalos
+        idxg = intervalos_gyro{k};
+        b_est = b_est + sum(Wg(idxg,:)).';
         total = total + numel(idxg);
     end
-    if total>0, b_est = b_est / total; else b_est = nanmedian(W)'; end
+    if total>0, b_est = b_est / total; else b_est = nanmedian(Wg)'; end
     s_est = [1;1;1]; S_est = zeros(3,3); K_est = eye(3);
-    W_cal = (W - b_est.');
+    W_cal = (Wg - b_est.');
     goto_only_bias = true;
 else
     goto_only_bias = false;
@@ -282,33 +285,33 @@ end
 % 9) SI HAY ROTACIÓN SUFICIENTE: calibración en 2 etapas (bias -> full)
 %% =========================
 if ~goto_only_bias
-    % Etapa A: estimar bias solo inicialmente
-    gyro_means_per_interval = nan(numIntervals,3);
-    for i=1:numIntervals
-        idxg = gyro_intervals{i};
-        gyro_means_per_interval(i,:) = mean(W(idxg,:),1);
+    % Etapa A: bias solo
+    gyro_means_per_interval = nan(numIntervalos,3);
+    for i=1:numIntervalos
+        idxg = intervalos_gyro{i};
+        gyro_means_per_interval(i,:) = mean(Wg(idxg,:),1);
     end
     b0 = nanmedian(gyro_means_per_interval,1)'; b0(~isfinite(b0)) = 0;
-    gyro_resfun_bias = @(b) gyro_residuals_Tedaldi([b;1;1;1;0;0;0], W, t_gyro, gyro_intervals, A_cal_mean, intervals, t_acc, g);
+    gyro_resfun_bias = @(b) gyro_residuals_Tedaldi([b;1;1;1;0;0;0], Wg, t_gyro, intervalos_gyro, A_cal_mean, intervalos, t_acc, gravedad);
     opts_bias = optimoptions('lsqnonlin','Display','iter','TolFun',1e-10,'TolX',1e-10,'MaxIter',200,'Algorithm','levenberg-marquardt');
     try
         b_est_stage = lsqnonlin(gyro_resfun_bias, b0, [-0.5;-0.5;-0.5], [0.5;0.5;0.5], opts_bias);
     catch
         b_est_stage = lsqnonlin(gyro_resfun_bias, b0, [], [], opts_bias);
     end
-    % Etapa B: calibración completa (full)
+    % Etapa B: full
     p0_full = [b_est_stage; 1;1;1; 0;0;0];
     lb_full = [-0.5;-0.5;-0.5;  0.7;0.7;0.7;  -0.15;-0.15;-0.15];
     ub_full = [ 0.5; 0.5; 0.5;  1.3;1.3;1.3;   0.15; 0.15; 0.15];
     opts_full = optimoptions('lsqnonlin','Display','iter','MaxIter',maxIterLSQ,'TolFun',1e-10,'TolX',1e-10,'Algorithm','levenberg-marquardt');
     try
-        p_est_full = lsqnonlin(gyro_resfun, p0_full, lb_full, ub_full, opts_full);
+        p_est_full = lsqnonlin(resfun_gyro, p0_full, lb_full, ub_full, opts_full);
     catch ME
         warning('lsqnonlin full falló: %s. Intentando regularizado.', ME.message);
         lambda_scale_try = 1e-3; lambda_S_try = 1e-3;
         regfun_try = @(p) [ lambda_scale_try*(p(4:6)-1); lambda_S_try*p(7:9) ];
         try
-            p_est_full = lsqnonlin(@(p) [gyro_resfun(p); regfun_try(p)], p0_full, lb_full, ub_full, opts_full);
+            p_est_full = lsqnonlin(@(p) [resfun_gyro(p); regfun_try(p)], p0_full, lb_full, ub_full, opts_full);
         catch
             p_est_full = p0_full;
         end
@@ -319,27 +322,26 @@ if ~goto_only_bias
     s12 = p_est_gyro(7); s13 = p_est_gyro(8); s23 = p_est_gyro(9);
     S_est = [0 s12 s13; 0 0 s23; 0 0 0];
     K_est = (eye(3) + S_est) * diag(s_est);
-    W_cal = (K_est * (W.' - b_est)).';
-
-    % === Crear versión escalada de W_cal para todo el script ===
-    W_cal_escalado = W_cal;
-    for k = 1:numel(gyro_intervals)
-        idxg = gyro_intervals{k};
-        W_cal_escalado(idxg, :) = W_cal_escalado(idxg, :) / 100;
+    W_cal = (K_est * (Wg.' - b_est)).';
+    % === Crear versión escalada de W_cal para visualización en todo el script ===
+    W_cal_scaled = W_cal;
+    for k = 1:numel(intervalos_gyro)
+        idxg = intervalos_gyro{k};
+        W_cal_scaled(idxg, :) = W_cal_scaled(idxg, :) / 100;
     end
 
     % ---------------------------
-    % Construcción de T^g (matriz de misalignment) - varias versiones
+    % Construcción de T^g (misalignment matrix) - varias versiones
+    % ---------------------------
     I3 = eye(3);
 
-    % 1) Matriz (I+S) directamente (la usada en el modelo)
+    % 1) Matriz (I+S) directamente (la usada en tu modelo)
     T_IplusS = I3 + S_est;
 
     % 2) Matriz inversa exacta: T_inv = inv(I+S)
     T_inv = inv(I3 + S_est);
 
     % 3) Primera aproximación (orden 1) válida para misalignments pequeños:
-    %    T_approx = I - S
     T_approx = I3 - S_est;
 
     % 4) Relación con K: (I+S) = K * diag(1./s_est)
@@ -352,12 +354,12 @@ if ~goto_only_bias
     fprintf('T_approx = I - S_est (1st-order approx):\n'); disp(T_approx);
     fprintf('T_fromK (reconstruida desde K_est y s_est):\n'); disp(T_fromK);
 
-    % 5) Extraer gamma con la notación del paper (ejemplo de asignación)
-    T = T_approx; % elegir la convención que pida el paper
+    % 5) Extraer gamma con la notación del paper
+    T = T_approx; % elige la que corresponda al paper (T_IplusS, T_inv, T_approx...)
     gamma_yz_A = -T(1,2);
     gamma_yz_A_alt =  T(1,3);
 
-    % Para comodidad, presentar gammas basados en T_approx (ajusta si el paper pide otra)
+    % Para comodidad, presentar gammas basados en T_approx (ajusta según el paper)
     gamma_xy = - (T(3,1));
     gamma_xz =  T(2,1);
     gamma_yx =  T(3,2);
@@ -365,8 +367,7 @@ if ~goto_only_bias
     gamma_zx =  T(1,3);
     gamma_zy = -T(2,3);
 
-    % Mostrar gammas (revisar signos según la notación del paper)
-    fprintf('\nGamma estimates (from T_approx, revisar signos según paper):\n');
+    fprintf('\nEstimaciones de Gamma (desde T_approx, revisar signos segun paper):\n');
     fprintf(' gamma_xy = %.6g\n gamma_xz = %.6g\n gamma_yx = %.6g\n gamma_yz = %.6g\n gamma_zx = %.6g\n gamma_zy = %.6g\n', ...
         gamma_xy, gamma_xz, gamma_yx, gamma_yz, gamma_zx, gamma_zy);
 else
@@ -377,9 +378,9 @@ end
 %% =========================
 % 10) MÉTRICAS: RMS por intervalo (integración) y RMS global
 %% =========================
-gyro_rms_per_interval = nan(numIntervals-1,1);
-for k=1:(numIntervals-1)
-    idxg = gyro_intervals{k};
+gyro_rms_per_interval = nan(numIntervalos-1,1);
+for k=1:(numIntervalos-1)
+    idxg = intervalos_gyro{k};
     if numel(idxg) < 2, continue; end
     if any(~isfinite(A_cal_mean(k,:))) || any(~isfinite(A_cal_mean(k+1,:))), continue; end
     gk = A_cal_mean(k,:).' / norm(A_cal_mean(k,:));
@@ -387,7 +388,7 @@ for k=1:(numIntervals-1)
     t_local = t_gyro(idxg);
     g0 = gk;
     for i=1:(numel(idxg)-1)
-        w_corr = (K_est * (W(idxg(i),:).' - b_est));
+        w_corr = (K_est * (Wg(idxg(i),:).' - b_est));
         dt = t_local(i+1) - t_local(i);
         g0 = rk4_gravity(g0, w_corr, dt);
     end
@@ -406,7 +407,7 @@ fprintf('Escalas (diag): [%.6f  %.6f  %.6f]\n', s_est(1), s_est(2), s_est(3));
 disp('Misalignment S (triangular superior):'); disp(S_est);
 disp('K = (I + S) * diag(s):'); disp(K_est);
 
-%% ======= Checks rápidos post-calibración =======
+%% ======= Chequeos rápidos post-calibración =======
 fprintf('\n=== VERIFICACIONES POST-CALIB ===\n');
 
 % 1) ¿Alguna escala en bound?
@@ -426,28 +427,28 @@ if any(isAtLowerBound) || any(isAtUpperBound)
 end
 
 % 2) Estadísticas de W_cal dentro de intervalos estáticos
-W_cal = (K_est * (W.' - b_est)).';
+W_cal = (K_est * (Wg.' - b_est)).';
 
-nInt = numel(gyro_intervals);
-std_por_eje = zeros(nInt,3);
-mean_por_eje = zeros(nInt,3);
+nInt = numel(intervalos_gyro);
+std_per_axis = zeros(nInt,3);
+mean_per_axis = zeros(nInt,3);
 
 for k=1:nInt
-    idxg = gyro_intervals{k};
+    idxg = intervalos_gyro{k};
     if numel(idxg)<2
-        std_por_eje(k,:)=NaN; 
-        mean_por_eje(k,:)=NaN; 
+        std_per_axis(k,:)=NaN; 
+        mean_per_axis(k,:)=NaN; 
         continue; 
     end
     dat = W_cal(idxg,:);
-    mean_por_eje(k,:) = mean(dat,1);
-    std_por_eje(k,:)  = std(dat,0,1);
+    mean_per_axis(k,:) = mean(dat,1);
+    std_per_axis(k,:)  = std(dat,0,1);
 end
 
 fprintf('W_cal: media por eje (mediana de intervalos) = [%g %g %g]\n', ...
-    median(mean_por_eje,'omitnan'));
+    median(mean_per_axis,'omitnan'));
 fprintf('W_cal: std por eje (mediana de intervalos)   = [%g %g %g]\n', ...
-    median(std_por_eje,'omitnan'));
+    median(std_per_axis,'omitnan'));
 
 % 3) Validación hold-out: 20% intervalos
 rng(0);
@@ -459,8 +460,8 @@ trainIdx = setdiff(I, holdIdx);
 % recalcula bias solo con train
 b_train = zeros(3,1); total=0;
 for k=trainIdx
-    idxg = gyro_intervals{k};
-    b_train = b_train + sum(W(idxg,:)).';
+    idxg = intervalos_gyro{k};
+    b_train = b_train + sum(Wg(idxg,:)).';
     total = total + numel(idxg);
 end
 b_train = b_train / total;
@@ -469,7 +470,7 @@ b_train = b_train / total;
 rms_hold = [];
 for k=1:(nInt-1)
     if ismember(k, holdIdx)
-        idxg = gyro_intervals{k};
+        idxg = intervalos_gyro{k};
         if numel(idxg)<2, continue; end
 
         gk = A_cal_mean(k,:).' / norm(A_cal_mean(k,:));
@@ -479,7 +480,7 @@ for k=1:(nInt-1)
         t_local = t_gyro(idxg);
 
         for i=1:(numel(idxg)-1)
-            w_corr = (K_est * (W(idxg(i),:).' - b_train));
+            w_corr = (K_est * (Wg(idxg(i),:).' - b_train));
             dt = t_local(i+1) - t_local(i);
             g0 = rk4_gravity(g0, w_corr, dt);
         end
@@ -492,22 +493,21 @@ fprintf('Hold-out RMS (media en intervalos hold): %g (n=%d)\n', ...
     mean(rms_hold,'omitnan'), numel(rms_hold));
 
 
-% Guardar resultados en estructura
+% Guardar
 calibracion = struct();
 calibracion.acc.M = M_est_acc; calibracion.acc.b = b_est_acc;
 calibracion.gyro.bias = b_est; calibracion.gyro.scale = s_est; calibracion.gyro.S = S_est; calibracion.gyro.K = K_est;
-calibracion.metrics.acc_RMS = sqrt(mean((magA_cal - g).^2));
+calibracion.metrics.acc_RMS = sqrt(mean((magA_cal - gravedad).^2));
 calibracion.metrics.gyro_rms = gyro_RMS_global;
-calibracion.intervals = intervals; calibracion.A_cal_mean = A_cal_mean;
+calibracion.intervals = intervalos; calibracion.A_cal_mean = A_cal_mean;
 calibracion.gyro_rms_per_interval = gyro_rms_per_interval;
-save('calibracion_unificada.mat','calibracion','gyro_intervals','A_cal_all','magA_cal');
+save('calibracion_unificada.mat','calibracion','intervalos_gyro','A_cal_all','magA_cal');
 
 %% =========================
 % 12) Generación tablas (opcional)
 %% =========================
-% Table II, V, VII, IX, XI simplificados
 tableII.mean_bias = b_est; tableII.mean_scale = s_est; tableII.mean_S = S_est;
-tableV = [ mean(abs(W(:,1)-b_est(1))), mean(abs(W(:,2)-b_est(2))), mean(abs(W(:,3)-b_est(3))) ];
+tableV = [ mean(abs(Wg(:,1)-b_est(1))), mean(abs(Wg(:,2)-b_est(2))), mean(abs(Wg(:,3)-b_est(3))) ];
 tableVII = [gyro_RMS_global; max(gyro_rms_per_interval); nanmean(gyro_rms_per_interval)];
 tableIX = K_est; tableXI = S_est;
 save('tablas_calibracion.mat','tableII','tableV','tableVII','tableIX','tableXI');
@@ -515,58 +515,54 @@ save('tablas_calibracion.mat','tableII','tableV','tableVII','tableIX','tableXI')
 fprintf('\nCalibración completa guardada en calibracion_unificada.mat y tablas_calibracion.mat\n');
 
 % --- PROMEDIOS DE GIROSCOPIO EN INTERVALOS ESTÁTICOS ---
-muestras_estaticas = [];   % aquí acumulamos todos los datos estáticos
-
-for k = 1:numel(gyro_intervals)
-    idx = gyro_intervals{k};
+all_static_samples = [];   % aquí acumulamos todos los datos estáticos
+for k = 1:numel(intervalos_gyro)
+    idx = intervalos_gyro{k};
     if numel(idx) < 1
         continue;
     end
-    % agregamos las muestras de este intervalo
-    muestras_estaticas = [muestras_estaticas; W(idx,:)];      % crudo
+    all_static_samples = [all_static_samples; Wg(idx,:)];      % crudo
 end
 
 % Promedios por eje del giroscopio crudo
-mean_w_crudo = mean(muestras_estaticas, 1);
+mean_w_crudo = mean(all_static_samples, 1);
 
 fprintf('\n=== PROMEDIOS GIROSCOPIO CRUDO EN INTERVALOS ESTÁTICOS ===\n');
 fprintf('ωx = %.6f rad/s\n', mean_w_crudo(1));
 fprintf('ωy = %.6f rad/s\n', mean_w_crudo(2));
-fprintf('ωz = %.6f rad/s\n', mean_w_crudo(3));
+fprintf('ωz = %.6f rad/s', mean_w_crudo(3));
+fprintf('\n');
 
 %% === PROMEDIOS GIROSCOPIO CALIBRADO (ESCALADO /100) SOLO EN INTERVALOS ESTÁTICOS ===
-muestras_cal_escaladas = [];
-
-for k = 1:numel(gyro_intervals)
-    idx = gyro_intervals{k};
+all_static_cal_scaled_samples = [];
+for k = 1:numel(intervalos_gyro)
+    idx = intervalos_gyro{k};
     if numel(idx) < 1
         continue;
     end
-    % Aquí tomas EXACTAMENTE lo que entra a la gráfica:
-    muestras_cal_escaladas = [muestras_cal_escaladas; W_cal_escalado(idx, :)];
+    all_static_cal_scaled_samples = [all_static_cal_scaled_samples; W_cal_scaled(idx, :)];
 end
 
-mean_W_cal_escalado = mean(muestras_cal_escaladas, 1);
+mean_W_cal_scaled = mean(all_static_cal_scaled_samples, 1);
 
 fprintf('\n=== PROMEDIOS GIROSCOPIO CALIBRADO (ESCALADO /100) ===\n');
-fprintf('ωx_scaled = %.9f rad/s\n', mean_W_cal_escalado(1));
-fprintf('ωy_scaled = %.9f rad/s\n', mean_W_cal_escalado(2));
-fprintf('ωz_scaled = %.9f rad/s\n', mean_W_cal_escalado(3));
+fprintf('ωx_scaled = %.9f rad/s\n', mean_W_cal_scaled(1));
+fprintf('ωy_scaled = %.9f rad/s\n', mean_W_cal_scaled(2));
+fprintf('ωz_scaled = %.9f rad/s\n', mean_W_cal_scaled(3));
 
 
 % --- Ahora para el GIROSCOPIO CALIBRADO (W_cal) ---
-muestras_cal = [];
-
-for k = 1:numel(gyro_intervals)
-    idx = gyro_intervals{k};
+all_static_cal_samples = [];
+for k = 1:numel(intervalos_gyro)
+    idx = intervalos_gyro{k};
     if numel(idx) < 1
         continue;
     end
-    muestras_cal = [muestras_cal; W_cal(idx,:)];
+    all_static_cal_samples = [all_static_cal_samples; W_cal(idx,:)];
 end
 
 % Promedios por eje del giroscopio calibrado
-mean_w_cal = mean(muestras_cal, 1);
+mean_w_cal = mean(all_static_cal_samples, 1);
 
 fprintf('\n=== PROMEDIOS GIROSCOPIO CALIBRADO EN INTERVALOS ESTÁTICOS ===\n');
 fprintf('ωx = %.6f rad/s\n', mean_w_cal(1));
@@ -631,24 +627,26 @@ function S = skew(w)
           w(3)   0   -w(1);
          -w(2)  w(1)   0   ];
 end
+
 %% =============================
-% 13) GRÁFICAS DE VALIDACIÓN
+% 13) GRAFICAS DE VALIDACIÓN
 %% =============================
 
 figure('Name','Acelerómetro crudo','NumberTitle','off');
 subplot(4,1,1);
-plot(t_acc, A_raw(:,1)); ylabel('Ax (m/s^2)'); grid on;
+plot(t_acc, Aac(:,1)); ylabel('Ax (m/s^2)'); grid on;
 
 subplot(4,1,2);
-plot(t_acc, A_raw(:,2)); ylabel('Ay (m/s^2)'); grid on;
+plot(t_acc, Aac(:,2)); ylabel('Ay (m/s^2)'); grid on;
 
 subplot(4,1,3);
-plot(t_acc, A_raw(:,3)); ylabel('Az (m/s^2)'); grid on;
+plot(t_acc, Aac(:,3)); ylabel('Az (m/s^2)'); grid on;
 
 subplot(4,1,4);
-plot(t_acc, sqrt(sum(A_raw.^2,2)));
+plot(t_acc, sqrt(sum(Aac.^2,2)));
 ylabel('|a|'); xlabel('Tiempo (s)'); grid on;
 sgtitle('Acelerómetro crudo (sin calibrar)');
+
 
 %% === Comparación Giroscopio Crudo / Calibrado (Calibrado / 100) ===
 figure('Name','Giroscopio Crudo vs Calibrado (escala reducida)','Color','w');
@@ -659,14 +657,14 @@ t = t_gyro;
 W_cal_scaled = W_cal;   % copia para no modificar el original
 
 % Recorrer intervalos estáticos y escalar solo esas muestras
-for k = 1:numel(gyro_intervals)
-    idxg = gyro_intervals{k};
+for k = 1:numel(intervalos_gyro)
+    idxg = intervalos_gyro{k};
     W_cal_scaled(idxg, :) = W_cal_scaled(idxg, :) / 1000;
 end
 
 %% ---- Eje wx ----
 subplot(3,1,1)
-plot(t, W(:,1), 'r', 'LineWidth', 1.0); hold on;
+plot(t, Wg(:,1), 'r', 'LineWidth', 1.0); hold on;
 plot(t, W_cal_scaled(:,1), 'g', 'LineWidth', 1.0);
 ylabel('\omega_x (rad/s)')
 legend('Crudo','Calibrado')
@@ -674,14 +672,14 @@ grid on; grid minor;
 
 %% ---- Eje wy ----
 subplot(3,1,2)
-plot(t, W(:,2), 'r', 'LineWidth', 1.0); hold on;
+plot(t, Wg(:,2), 'r', 'LineWidth', 1.0); hold on;
 plot(t, W_cal_scaled(:,2), 'g', 'LineWidth', 1.0);
 ylabel('\omega_y (rad/s)')
 grid on; grid minor;
 
 %% ---- Eje wz ----
 subplot(3,1,3)
-plot(t, W(:,3), 'r', 'LineWidth', 1.0); hold on;
+plot(t, Wg(:,3), 'r', 'LineWidth', 1.0); hold on;
 plot(t, W_cal_scaled(:,3), 'g', 'LineWidth', 1.0);
 ylabel('\omega_z (rad/s)')
 xlabel('Tiempo (s)')
@@ -689,9 +687,9 @@ grid on; grid minor;
 
 %% ======= Grafica 2: Giroscopio crudo =======
 figure;
-plot(t_gyro, W(:,1)); hold on;
-plot(t_gyro, W(:,2));
-plot(t_gyro, W(:,3));
+plot(t_gyro, Wg(:,1)); hold on;
+plot(t_gyro, Wg(:,2));
+plot(t_gyro, Wg(:,3));
 xlabel('Tiempo (s)');
 ylabel('Velocidad angular (rad/s)');
 title('Giroscopio crudo - 3 ejes');
